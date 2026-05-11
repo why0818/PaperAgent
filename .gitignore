@@ -1,0 +1,13 @@
+.packages/
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/
+.tmp/
+.tmp_smoke/
+data/uploads/
+data/library.json
+data/*.tmp
+data/config.local.json
+data/analyses/
+data/chats/
