@@ -14,10 +14,12 @@ import json
 import re
 import sys
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from paperagent.data_portability import export_data_package, import_data_package
 from paperagent.knowledge_base import KnowledgeBase
 from paperagent.llm import llm_config, save_llm_models
 from paperagent.metadata_store import editable_metadata, load_venues, update_document_metadata, upsert_venue
@@ -123,6 +125,9 @@ class PaperAgentHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/config":
             self.send_json({"llm": llm_config()})
             return
+        if parsed.path == "/api/data/export":
+            self.handle_data_export()
+            return
         if parsed.path == "/api/venues":
             with KB_LOCK:
                 self.send_json(venues_payload())
@@ -168,6 +173,9 @@ class PaperAgentHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/upload":
             self.handle_upload()
+            return
+        if parsed.path == "/api/data/import":
+            self.handle_data_import()
             return
         if parsed.path == "/api/ask":
             self.handle_ask()
@@ -438,6 +446,43 @@ class PaperAgentHandler(BaseHTTPRequestHandler):
         save_llm_models(chat_model, analyze_model)
         self.send_json({"success": True, "llm": llm_config()})
 
+    def handle_data_export(self) -> None:
+        with KB_LOCK:
+            content = export_data_package(DATA_DIR)
+        filename = f"paperagent-data-{datetime.now(timezone.utc).astimezone().strftime('%Y%m%d-%H%M%S')}.zip"
+        self.send_binary(
+            content,
+            content_type="application/zip",
+            filename=filename,
+        )
+
+    def handle_data_import(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self.send_error_json(400, "请上传 PaperAgent 数据包 zip 文件。")
+            return
+        environ = {
+            "REQUEST_METHOD": "POST",
+            "CONTENT_TYPE": content_type,
+            "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+        }
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ=environ,
+            keep_blank_values=True,
+        )
+        item = form["file"] if "file" in form else None
+        if not item or not getattr(item, "file", None):
+            self.send_error_json(400, "没有收到数据包文件。")
+            return
+        content = item.file.read()
+        with KB_LOCK:
+            result = import_data_package(DATA_DIR, content)
+            KB.store.load()
+            KB.refresh()
+        self.send_json({"success": True, "imported": result})
+
     def handle_update_document_metadata(self, document_id: str) -> None:
         payload = self.read_json()
         with KB_LOCK:
@@ -564,6 +609,15 @@ class PaperAgentHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_binary(self, content: bytes, content_type: str, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
 
     def send_error_json(self, status: int, message: str) -> None:
         self.send_json({"error": message}, status=status)
@@ -808,6 +862,10 @@ INDEX_HTML = r"""<!doctype html>
     .field input, .field textarea { width:100%; padding:11px 13px; border:2px solid var(--line); border-radius:12px; background:#fff; outline:none; }
     .field textarea { resize:vertical; min-height:78px; line-height:1.5; }
     .field input:focus, .field textarea:focus, .field select:focus { border-color:var(--primary); box-shadow:0 0 0 3px rgba(255, 138, 61, 0.12); }
+    .settings-note { color:var(--muted); font-size:13px; line-height:1.55; margin:0 0 12px; }
+    .settings-divider { border-top:2px solid var(--line); margin:20px 0; padding-top:18px; }
+    .data-actions { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .data-status { color:var(--muted); font-size:13px; min-height:18px; margin-top:10px; }
 
     /* PDF Viewer */
     .viewer-layout { display: grid; grid-template-columns: 420px 1fr; gap: 30px; height: calc(100vh - 160px); }
@@ -992,6 +1050,18 @@ INDEX_HTML = r"""<!doctype html>
         <label for="analyzeModelSelect">AI 解析模型</label>
         <select id="analyzeModelSelect"></select>
       </div>
+      <div class="settings-divider">
+        <div class="field">
+          <label>本地数据同步</label>
+          <p class="settings-note">导出数据包会包含 PDF、索引、精读结果、对话历史和期刊会议库，不包含 API Key 或本地模型配置。</p>
+          <div class="data-actions">
+            <button class="btn btn-small" id="exportDataBtn">导出数据包</button>
+            <button class="btn btn-small" id="importDataBtn">导入数据包</button>
+            <input id="dataImportInput" type="file" accept=".zip,application/zip" style="display:none" />
+          </div>
+          <div class="data-status" id="dataSyncStatus"></div>
+        </div>
+      </div>
       <div class="settings-actions">
         <button class="btn btn-small" id="cancelSettingsBtn">取消</button>
         <button class="btn btn-primary btn-small" id="saveModelBtn">保存设置</button>
@@ -1108,6 +1178,38 @@ INDEX_HTML = r"""<!doctype html>
       }).then(r => r.json());
       
       closeSettings();
+    }
+
+    function exportDataPackage() {
+      const status = $('#dataSyncStatus');
+      if (status) status.textContent = '正在准备数据包...';
+      window.location.href = '/api/data/export';
+      setTimeout(() => {
+        if (status) status.textContent = '数据包已开始下载。';
+      }, 500);
+    }
+
+    async function importDataPackage(file) {
+      if (!file) return;
+      const status = $('#dataSyncStatus');
+      if (status) status.textContent = '正在导入数据包...';
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const result = await fetch('/api/data/import', { method: 'POST', body: form }).then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        });
+        const imported = result.imported || {};
+        if (status) {
+          status.textContent = `导入完成：论文 ${imported.documents || 0}，切片 ${imported.chunks || 0}，PDF ${imported.uploads || 0}。`;
+        }
+        await loadDocs();
+        await loadVenues();
+        renderSelectedDocs();
+      } catch (err) {
+        if (status) status.textContent = '导入失败：' + err.message;
+      }
     }
 
     function openSettings() {
@@ -2123,6 +2225,15 @@ INDEX_HTML = r"""<!doctype html>
       // 模型保存按钮
       const saveModelBtn = $('#saveModelBtn');
       if (saveModelBtn) saveModelBtn.addEventListener('click', saveModels);
+      const exportDataBtn = $('#exportDataBtn');
+      if (exportDataBtn) exportDataBtn.addEventListener('click', exportDataPackage);
+      const importDataBtn = $('#importDataBtn');
+      const dataImportInput = $('#dataImportInput');
+      if (importDataBtn && dataImportInput) importDataBtn.addEventListener('click', () => dataImportInput.click());
+      if (dataImportInput) dataImportInput.addEventListener('change', (e) => {
+        importDataPackage(e.target.files?.[0]);
+        e.target.value = '';
+      });
       const settingsBtn = $('#settingsBtn');
       if (settingsBtn) settingsBtn.addEventListener('click', openSettings);
       const closeSettingsBtn = $('#closeSettingsBtn');

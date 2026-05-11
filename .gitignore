@@ -1,4 +1,5 @@
 .packages/
+.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -9,5 +10,6 @@ data/uploads/
 data/library.json
 data/*.tmp
 data/config.local.json
+data/venues.json
 data/analyses/
 data/chats/
